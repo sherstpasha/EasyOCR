@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
-
 from .recognition import get_recognizer, get_text
-from .utils import group_text_box, get_image_list, calculate_md5, get_paragraph,\
-                   download_and_unzip, printProgressBar, diff, reformat_input,\
-                   make_rotated_img_list, set_result_with_confidence,\
-                   reformat_input_batched, merge_to_free
+from .utils import (
+    group_text_box, get_image_list, calculate_md5, get_paragraph,
+    download_and_unzip, diff, reformat_input,
+    make_rotated_img_list, set_result_with_confidence,
+    reformat_input_batched, merge_to_free
+)
 from .config import *
 from bidi.algorithm import get_display
 import numpy as np
@@ -16,6 +17,7 @@ from PIL import Image
 from logging import getLogger
 import yaml
 import json
+from types import SimpleNamespace
 
 if sys.version_info[0] == 2:
     from io import open
@@ -30,45 +32,33 @@ LOGGER = getLogger(__name__)
 class Reader(object):
 
     def __init__(self, lang_list, gpu=True, model_storage_directory=None,
-                 user_network_directory=None, detect_network="craft", 
-                 recog_network='standard', download_enabled=True, 
-                 detector=True, recognizer=True, verbose=True, 
+                 user_network_directory=None, detect_network="craft",
+                 recog_network='standard', download_enabled=True,
+                 detector=True, recognizer=True, verbose=True,
                  quantize=True, cudnn_benchmark=False):
-        """Create an EasyOCR Reader
 
-        Parameters:
-            lang_list (list): Language codes (ISO 639) for languages to be recognized during analysis.
-
-            gpu (bool): Enable GPU support (default)
-
-            model_storage_directory (string): Path to directory for model data. If not specified,
-            models will be read from a directory as defined by the environment variable
-            EASYOCR_MODULE_PATH (preferred), MODULE_PATH (if defined), or ~/.EasyOCR/.
-
-            user_network_directory (string): Path to directory for custom network architecture.
-            If not specified, it is as defined by the environment variable
-            EASYOCR_MODULE_PATH (preferred), MODULE_PATH (if defined), or ~/.EasyOCR/.
-
-            download_enabled (bool): Enabled downloading of model data via HTTP (default).
-        """
+        # ---- 0) Paths & Device ----
         self.verbose = verbose
         self.download_enabled = download_enabled
 
+        # Model storage dir
         self.model_storage_directory = MODULE_PATH + '/model'
         if model_storage_directory:
             self.model_storage_directory = model_storage_directory
-        Path(self.model_storage_directory).mkdir(parents=True, exist_ok=True)
+        os.makedirs(self.model_storage_directory, exist_ok=True)
 
+        # User network dir
         self.user_network_directory = MODULE_PATH + '/user_network'
         if user_network_directory:
             self.user_network_directory = user_network_directory
-        Path(self.user_network_directory).mkdir(parents=True, exist_ok=True)
+        os.makedirs(self.user_network_directory, exist_ok=True)
         sys.path.append(self.user_network_directory)
 
+        # Device selection
         if gpu is False:
             self.device = 'cpu'
             if verbose:
-                LOGGER.warning('Using CPU. Note: This module is much faster with a GPU.')
+                LOGGER.warning('Using CPU. Faster with GPU.')
         elif gpu is True:
             if torch.cuda.is_available():
                 self.device = 'cuda'
@@ -77,98 +67,163 @@ class Reader(object):
             else:
                 self.device = 'cpu'
                 if verbose:
-                    LOGGER.warning('Neither CUDA nor MPS are available - defaulting to CPU. Note: This module is much faster with a GPU.')
+                    LOGGER.warning('No CUDA/MPS available; defaulting to CPU.')
         else:
             self.device = gpu
 
+        # ---- 1) Detection & Recognition Models Registry ----
         self.detection_models = detection_models
         self.recognition_models = recognition_models
-
-        # check and download detection model
         self.support_detection_network = ['craft', 'dbnet18']
-        self.quantize=quantize, 
-        self.cudnn_benchmark=cudnn_benchmark
+        self.quantize = quantize
+        self.cudnn_benchmark = cudnn_benchmark
+
+        # ---- 2) Initialize Detector ----
         if detector:
             detector_path = self.getDetectorPath(detect_network)
-        
-        # recognition model
-        separator_list = {}
 
-        if recog_network in ['standard'] + [model for model in recognition_models['gen1']] + [model for model in recognition_models['gen2']]:
-            if recog_network in [model for model in recognition_models['gen1']]:
-                model = recognition_models['gen1'][recog_network]
+        # ---- 3) Build Recognition Config ----
+        separator_list = {}
+        dict_list = {
+            lang: os.path.join(BASE_PATH, 'dict', f"{lang}.txt")
+            for lang in lang_list
+        }
+        recog_config = {}
+
+        if recog_network in ['standard'] + list(self.recognition_models['gen1']) + list(self.recognition_models['gen2']):
+            # 3a) Встроенная сеть gen1
+            if recog_network in self.recognition_models['gen1']:
+                base = self.recognition_models['gen1'][recog_network]
                 recog_network = 'generation1'
-                self.model_lang = model['model_script']
-            elif recog_network in [model for model in recognition_models['gen2']]:
-                model = recognition_models['gen2'][recog_network]
+                self.model_lang = base['model_script']
+                flat = {'input_channel': 1, 'output_channel': 512, 'hidden_size': 512, "easyocr": True}
+    
+            # 3b) Встроенная сеть gen2
+            elif recog_network in self.recognition_models['gen2']:
+                base = self.recognition_models['gen2'][recog_network]
                 recog_network = 'generation2'
-                self.model_lang = model['model_script']
-            else: # auto-detect
+                self.model_lang = base['model_script']
+                flat = {'input_channel': 1, 'output_channel': 256, 'hidden_size': 256, "easyocr": True}
+    
+            # 3c) авто-детект по lang_list
+            else:
                 unknown_lang = set(lang_list) - set(all_lang_list)
-                if unknown_lang != set():
-                    raise ValueError(unknown_lang, 'is not supported')
-                # choose recognition model
+                if unknown_lang:
+                    raise ValueError(f"Язык(и) {unknown_lang} не поддерживаются")
+
                 if lang_list == ['en']:
                     self.setModelLanguage('english', lang_list, ['en'], '["en"]')
                     model = recognition_models['gen2']['english_g2']
+                    base = self.recognition_models['gen2']['english_g2']
                     recog_network = 'generation2'
+                    flat = {'input_channel': 1, 'output_channel': 256, 'hidden_size': 256, "easyocr": True}
+
                 elif 'th' in lang_list:
                     self.setModelLanguage('thai', lang_list, ['th','en'], '["th","en"]')
                     model = recognition_models['gen1']['thai_g1']
+                    base = self.recognition_models['gen1']['thai_g1']
                     recog_network = 'generation1'
+                    flat = {'input_channel': 1, 'output_channel': 512, 'hidden_size': 512, "easyocr": True}
+
                 elif 'ch_tra' in lang_list:
                     self.setModelLanguage('chinese_tra', lang_list, ['ch_tra','en'], '["ch_tra","en"]')
                     model = recognition_models['gen1']['zh_tra_g1']
+                    base = self.recognition_models['gen1']['zh_tra_g1']
                     recog_network = 'generation1'
+                    flat = {'input_channel': 1, 'output_channel': 512, 'hidden_size': 512, "easyocr": True}
+
                 elif 'ch_sim' in lang_list:
                     self.setModelLanguage('chinese_sim', lang_list, ['ch_sim','en'], '["ch_sim","en"]')
                     model = recognition_models['gen2']['zh_sim_g2']
+                    base = self.recognition_models['gen2']['zh_sim_g2']
                     recog_network = 'generation2'
+                    flat = {'input_channel': 1, 'output_channel': 256, 'hidden_size': 256, "easyocr": True}
+
                 elif 'ja' in lang_list:
                     self.setModelLanguage('japanese', lang_list, ['ja','en'], '["ja","en"]')
                     model = recognition_models['gen2']['japanese_g2']
+                    base = self.recognition_models['gen2']['japanese_g2']
                     recog_network = 'generation2'
+                    flat = {'input_channel': 1, 'output_channel': 256, 'hidden_size': 256, "easyocr": True}
+
                 elif 'ko' in lang_list:
                     self.setModelLanguage('korean', lang_list, ['ko','en'], '["ko","en"]')
                     model = recognition_models['gen2']['korean_g2']
+                    base = self.recognition_models['gen2']['korean_g2']
                     recog_network = 'generation2'
+                    flat = {'input_channel': 1, 'output_channel': 256, 'hidden_size': 256, "easyocr": True}
+
                 elif 'ta' in lang_list:
                     self.setModelLanguage('tamil', lang_list, ['ta','en'], '["ta","en"]')
                     model = recognition_models['gen1']['tamil_g1']
+                    base = self.recognition_models['gen1']['tamil_g1']
                     recog_network = 'generation1'
+                    flat = {'input_channel': 1, 'output_channel': 512, 'hidden_size': 512, "easyocr": True}
+
                 elif 'te' in lang_list:
                     self.setModelLanguage('telugu', lang_list, ['te','en'], '["te","en"]')
                     model = recognition_models['gen2']['telugu_g2']
+                    base = self.recognition_models['gen2']['telugu_g2']
                     recog_network = 'generation2'
+                    flat = {'input_channel': 1, 'output_channel': 256, 'hidden_size': 256, "easyocr": True}
+
                 elif 'kn' in lang_list:
                     self.setModelLanguage('kannada', lang_list, ['kn','en'], '["kn","en"]')
                     model = recognition_models['gen2']['kannada_g2']
+                    base = self.recognition_models['gen2']['kannada_g2']
                     recog_network = 'generation2'
+                    flat = {'input_channel': 1, 'output_channel': 256, 'hidden_size': 256, "easyocr": True}
+
                 elif set(lang_list) & set(bengali_lang_list):
                     self.setModelLanguage('bengali', lang_list, bengali_lang_list+['en'], '["bn","as","en"]')
                     model = recognition_models['gen1']['bengali_g1']
+                    base = self.recognition_models['gen1']['bengali_g1']
                     recog_network = 'generation1'
+                    flat = {'input_channel': 1, 'output_channel': 512, 'hidden_size': 512, "easyocr": True}
+
                 elif set(lang_list) & set(arabic_lang_list):
                     self.setModelLanguage('arabic', lang_list, arabic_lang_list+['en'], '["ar","fa","ur","ug","en"]')
                     model = recognition_models['gen1']['arabic_g1']
+                    base = self.recognition_models['gen1']['arabic_g1']
                     recog_network = 'generation1'
+                    flat = {'input_channel': 1, 'output_channel': 512, 'hidden_size': 512, "easyocr": True}
+
                 elif set(lang_list) & set(devanagari_lang_list):
                     self.setModelLanguage('devanagari', lang_list, devanagari_lang_list+['en'], '["hi","mr","ne","en"]')
                     model = recognition_models['gen1']['devanagari_g1']
+                    base = self.recognition_models['gen1']['devanagari_g1']
                     recog_network = 'generation1'
+                    flat = {'input_channel': 1, 'output_channel': 512, 'hidden_size': 512, "easyocr": True}
+
                 elif set(lang_list) & set(cyrillic_lang_list):
                     self.setModelLanguage('cyrillic', lang_list, cyrillic_lang_list+['en'],
                                           '["ru","rs_cyrillic","be","bg","uk","mn","en"]')
                     model = recognition_models['gen2']['cyrillic_g2']
+                    base = self.recognition_models['gen2']['cyrillic_g2']
                     recog_network = 'generation2'
-                else:
-                    self.model_lang = 'latin'
-                    model = recognition_models['gen2']['latin_g2']
-                    recog_network = 'generation2'
-            self.character = model['characters']
+                    flat = {'input_channel': 1, 'output_channel': 256, 'hidden_size': 256, "easyocr": True}
 
-            model_path = os.path.join(self.model_storage_directory, model['filename'])
-            # check recognition model file
+                else:
+                    # all other → latin
+                    self.model_lang = 'latin'
+                    base = self.recognition_models['gen2']['latin_g2']
+                    recog_network = 'generation2'
+                    flat = {'input_channel': 1, 'output_channel': 256, 'hidden_size': 256, "easyocr": True}
+                    
+                # Собираем единый конфиг
+            recog_config = {
+                    **base,
+                    **flat,
+                    'character_list': base['characters'],
+                    "Prediction": "CTC"
+                }
+            self.character = recog_config['character_list']
+            model_path = os.path.join(self.model_storage_directory, recog_config['filename'])
+                # язык/словари, если нужно
+            self.setLanguageList(lang_list, base)
+
+            self.model_lang = recog_config.get('model_script', None)
+                        # загружаем/проверяем его точно так же, как для встроенных
             if recognizer:
                 if os.path.isfile(model_path) == False:
                     if not self.download_enabled:
@@ -190,47 +245,55 @@ class Reader(object):
                     LOGGER.info('Download complete')
             self.setLanguageList(lang_list, model)
 
-        else: # user-defined model
-            with open(os.path.join(self.user_network_directory, recog_network+ '.yaml'), encoding='utf8') as file:
-                recog_config = yaml.load(file, Loader=yaml.FullLoader)
-            
-            global imgH # if custom model, save this variable. (from *.yaml)
-            if recog_config['imgH']:
+        else:
+            # --- user-defined model ---
+            # загружаем конфиг из YAML в user_network_directory
+            with open(os.path.join(self.user_network_directory,
+                                recog_network + '.yaml'),
+                    encoding='utf8') as f:
+                recog_config = yaml.load(f, Loader=yaml.FullLoader)
+
+            # если в конфиге задан imgH — сохраняем его глобально
+            if recog_config.get('imgH'):
+                global imgH
                 imgH = recog_config['imgH']
-                
+
+            # проверяем, что пользовательский конфиг поддерживает заявленные lang_list
             available_lang = recog_config['lang_list']
-            self.setModelLanguage(recog_network, lang_list, available_lang, str(available_lang))
-            #char_file = os.path.join(self.user_network_directory, recog_network+ '.txt')
+            self.setModelLanguage(recog_network, lang_list,
+                                available_lang, str(available_lang))
+
+            # список символов
             self.character = recog_config['character_list']
-            model_file = recog_network+ '.pth'
-            model_path = os.path.join(self.model_storage_directory, model_file)
+
+            # имя модели — pth-файл с тем же именем, что YAML
+            model_file = recog_network + '.pth'
+            model_path = os.path.join(self.model_storage_directory,
+                                    model_file)
             self.setLanguageList(lang_list, recog_config)
 
-        dict_list = {}
-        for lang in lang_list:
-            dict_list[lang] = os.path.join(BASE_PATH, 'dict', lang + ".txt")
+            print(model_path, os.path.isfile(model_path))
+            recog_config["easyocr"] = False
+            print(recognizer)
+            
 
+
+        # ---- 5) Finalize Detector ----
         if detector:
             self.detector = self.initDetector(detector_path)
-            
-        if recognizer:
-            if recog_network == 'generation1':
-                network_params = {
-                    'input_channel': 1,
-                    'output_channel': 512,
-                    'hidden_size': 512
-                    }
-            elif recog_network == 'generation2':
-                network_params = {
-                    'input_channel': 1,
-                    'output_channel': 256,
-                    'hidden_size': 256
-                    }
-            else:
-                network_params = recog_config['network_params']
-            self.recognizer, self.converter = get_recognizer(recog_network, network_params,\
-                                                         self.character, separator_list,\
-                                                         dict_list, model_path, device = self.device, quantize=quantize)
+
+        # ---- 6) Instantiate Recognizer ----
+        opt = SimpleNamespace(**recog_config)
+        self.recognizer, self.converter = get_recognizer(
+            recog_network=recog_network,
+            recog_config=opt,
+            separator_list=separator_list,
+            dict_list=dict_list,
+            model_path=model_path,
+            device=self.device,
+            quantize=quantize
+        )
+
 
     def getDetectorPath(self, detect_network):
         if detect_network in self.support_detection_network:

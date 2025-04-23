@@ -7,7 +7,7 @@ import torchvision.transforms as transforms
 import numpy as np
 from collections import OrderedDict
 import importlib
-from .utils import CTCLabelConverter
+from .utils import CTCLabelConverter, AttnLabelConverter
 import math
 
 def custom_mean(x):
@@ -108,7 +108,10 @@ def recognizer_predict(model, converter, test_loader, batch_max_length,\
             length_for_pred = torch.IntTensor([batch_max_length] * batch_size).to(device)
             text_for_pred = torch.LongTensor(batch_size, batch_max_length + 1).fill_(0).to(device)
 
-            preds = model(image, text_for_pred)
+            if isinstance(converter, CTCLabelConverter):
+                preds = model(image, text_for_pred)
+            else:
+                preds = model(image, text_for_pred, is_train=False)
 
             # Select max probabilty (greedy decoding) then decode index to character
             preds_size = torch.IntTensor([preds.size(1)] * batch_size)
@@ -121,17 +124,26 @@ def recognizer_predict(model, converter, test_loader, batch_max_length,\
             preds_prob = preds_prob/np.expand_dims(pred_norm, axis=-1)
             preds_prob = torch.from_numpy(preds_prob).float().to(device)
 
-            if decoder == 'greedy':
-                # Select max probabilty (greedy decoding) then decode index to character
-                _, preds_index = preds_prob.max(2)
-                preds_index = preds_index.view(-1)
-                preds_str = converter.decode_greedy(preds_index.data.cpu().detach().numpy(), preds_size.data)
-            elif decoder == 'beamsearch':
-                k = preds_prob.cpu().detach().numpy()
-                preds_str = converter.decode_beamsearch(k, beamWidth=beamWidth)
-            elif decoder == 'wordbeamsearch':
-                k = preds_prob.cpu().detach().numpy()
-                preds_str = converter.decode_wordbeamsearch(k, beamWidth=beamWidth)
+            print(converter, type(converter))
+
+            if isinstance(converter, CTCLabelConverter):
+                if decoder == 'greedy':
+                    # Select max probabilty (greedy decoding) then decode index to character
+                    _, preds_index = preds_prob.max(2)
+                    preds_index = preds_index.view(-1)
+                    preds_str = converter.decode_greedy(preds_index.data.cpu().detach().numpy(), preds_size.data)
+                elif decoder == 'beamsearch':
+                    k = preds_prob.cpu().detach().numpy()
+                    preds_str = converter.decode_beamsearch(k, beamWidth=beamWidth)
+                elif decoder == 'wordbeamsearch':
+                    k = preds_prob.cpu().detach().numpy()
+                    preds_str = converter.decode_wordbeamsearch(k, beamWidth=beamWidth)
+            else:
+                preds = model(image, text_for_pred, is_train=False)
+
+                # select max probabilty (greedy decoding) then decode index to character
+                _, preds_index = preds.max(2)
+                preds_str = converter.decode(preds_index, length_for_pred)
 
             preds_prob = preds_prob.cpu().detach().numpy()
             values = preds_prob.max(axis=2)
@@ -144,38 +156,73 @@ def recognizer_predict(model, converter, test_loader, batch_max_length,\
                 else:
                     preds_max_prob.append(np.array([0]))
 
+            preds_prob = F.softmax(preds, dim=2)
+            preds_max_prob, _ = preds_prob.max(dim=2)
+            for pred, pred_max_prob in zip(preds_str, preds_max_prob):
+                if isinstance(converter, CTCLabelConverter):
+                    pred_EOS = pred.find('[s]')
+                    pred = pred[:pred_EOS]  # prune after "end of sentence" token ([s])
+                    pred_max_prob = pred_max_prob[:pred_EOS]
+
+                # calculate confidence score (= multiply of pred_max_prob)
+                confidence_score = pred_max_prob.cumprod(dim=0)[-1]
+
             for pred, pred_max_prob in zip(preds_str, preds_max_prob):
                 confidence_score = custom_mean(pred_max_prob)
                 result.append([pred, confidence_score])
 
     return result
 
-def get_recognizer(recog_network, network_params, character,\
-                   separator_list, dict_list, model_path,\
-                   device = 'cpu', quantize = True):
-    print(network_params)
-    converter = CTCLabelConverter(character, separator_list, dict_list)
-    num_class = len(converter.character)
+def get_recognizer(recog_network, recog_config,
+                   separator_list, dict_list, model_path,
+                   device='cpu', quantize=True):
+    """
+    recog_network: 'generation1'|'generation2' или путь модуля
+    recog_config: dict, должен содержать поля:
+        - network_params: dict для инициализации модели
+        - character_list: строка символов
+    """
+    # 1) извлекаем параметры сети и список символов
+    character_list = recog_config.character_list
 
+    # 2) строим конвертер CTC
+    converter = CTCLabelConverter(character_list, separator_list, dict_list)
+    if 'CTC' in recog_config.Prediction:
+        converter = CTCLabelConverter(recog_config.character_list)
+    else:
+        converter = AttnLabelConverter(recog_config.character_list)
+
+    recog_config.num_class = len(converter.character)
+
+    # 3) импортируем нужный модуль модели
     if recog_network == 'generation1':
         model_pkg = importlib.import_module("easyocr.model.model")
     elif recog_network == 'generation2':
         model_pkg = importlib.import_module("easyocr.model.vgg_model")
     else:
         model_pkg = importlib.import_module(recog_network)
-    model = model_pkg.Model(num_class=num_class, **network_params)
 
+    # 4) создаём модель: передаем num_class + остальные network_params
+    print(recog_config)
+    if recog_config.easyocr:
+        model = model_pkg.Model(output_channel = recog_config.output_channel, hidden_size=recog_config.hidden_size, num_class=recog_config.num_class, input_channel=recog_config.input_channel)
+    else:
+        model = model_pkg.Model(recog_config)
+
+    # 5) загружаем веса
     if device == 'cpu':
         state_dict = torch.load(model_path, map_location=device)
-        new_state_dict = OrderedDict()
-        for key, value in state_dict.items():
-            new_key = key[7:]
-            new_state_dict[new_key] = value
-        model.load_state_dict(new_state_dict)
+        # убираем префикс 'module.' при необходимости
+        new_sd = OrderedDict()
+        for k, v in state_dict.items():
+            nk = k[7:] if k.startswith('module.') else k
+            new_sd[nk] = v
+        model.load_state_dict(new_sd)
+        # динамическое квантование опционально
         if quantize:
             try:
                 torch.quantization.quantize_dynamic(model, dtype=torch.qint8, inplace=True)
-            except:
+            except Exception:
                 pass
     else:
         model = torch.nn.DataParallel(model).to(device)
